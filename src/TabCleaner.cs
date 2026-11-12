@@ -25,7 +25,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 static class Program {
-    public const string Version = "1.4.1";
+    public const string Version = "1.4.2";
 
     [STAThread]
     static void Main(string[] args) {
@@ -254,6 +254,9 @@ class TrayApp : ApplicationContext {
 
         var menu = new ContextMenuStrip();
         ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        var header = new ToolStripMenuItem("Tab Cleaner  v" + Program.Version) { Enabled = false };
+        menu.Items.Add(header);
+        menu.Items.Add(new ToolStripSeparator());
         toggleItem.Font = new Font(toggleItem.Font, FontStyle.Bold);
         toggleItem.Click += delegate { SetStopped(!stopped); };
         menu.Items.Add(toggleItem);
@@ -497,7 +500,7 @@ class TrayApp : ApplicationContext {
         limitMenu.Text = idleMinutes == 1 ? "Idle limit: 1 minute (testing - every tab)"
                        : "Idle limit: " + idleMinutes + " minutes (" + Math.Min(bigTabMinutes, idleMinutes) + " for tabs over " + bigTabPercent + "% memory)";
         tray.Icon = stopped ? iconStopped : iconOn;
-        string tip = "Tab Cleaner: " + (stopped ? "stopped" : "running, " + idleMinutes + " min limit") + ", " + endedToday + " ended today";
+        string tip = "Tab Cleaner v" + Program.Version + " - " + (stopped ? "stopped" : "running, " + idleMinutes + " min limit") + ", " + endedToday + " ended today";
         tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
     }
 
