@@ -1,4 +1,4 @@
-﻿// Tab Cleaner: a taskbar (system tray) app that ends WorkStream Browser tabs left idle for 30 minutes, using the
+// Tab Cleaner: a taskbar (system tray) app that ends WorkStream Browser tabs left idle for 30 minutes, using the
 // browser's own Task Manager (Shift+Esc) to tell real tabs from things embedded in them. Nothing inside the browser
 // is changed.
 //
@@ -25,7 +25,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 static class Program {
-    public const string Version = "1.4.0";
+    public const string Version = "1.4.1";
 
     [STAThread]
     static void Main(string[] args) {
@@ -380,6 +380,7 @@ class TrayApp : ApplicationContext {
         if (!anySelected) return;                                       // can't tell what's active: do nothing
         var due = new List<DueTab>();
         var titleCount = new Dictionary<string, int>();
+        var protectedTitles = new HashSet<string>();   // a title with a live copy that is active or not yet idle: never end it
         lock (idleSince) {
             var seen = new HashSet<string>();
             foreach (var t in strip) {
@@ -390,14 +391,14 @@ class TrayApp : ApplicationContext {
                 titleCount[title] = ++n;
                 string key = title + "#" + n;
                 seen.Add(key);
-                if (t.Name.EndsWith(" - Crashed")) continue;            // nothing running
+                if (t.Name.EndsWith(" - Crashed")) continue;            // already ended: no process, ignore it
                 counts[0]++;
-                if (t.Selected) { idleSince.Remove(key); continue; }   // active
+                if (t.Selected) { idleSince.Remove(key); protectedTitles.Add(title); continue; }   // active: keep this title
                 counts[1]++;
                 TabState st;
-                if (!idleSince.TryGetValue(key, out st)) { idleSince[key] = new TabState { Since = now }; continue; }
+                if (!idleSince.TryGetValue(key, out st)) { idleSince[key] = new TabState { Since = now }; protectedTitles.Add(title); continue; }
                 double idleMin = (now - st.Since).TotalMinutes;
-                if (idleMin < bigLimit) continue;
+                if (idleMin < bigLimit) { protectedTitles.Add(title); continue; }   // a copy not idle long enough yet
                 string hit = Allowed(title, allowNow);
                 if (hit != null) { if (reported.Add(key)) notes.Add("Kept \"" + Short(title) + "\" (allow-listed: " + hit + ")"); continue; }
                 if (idleMin >= limit) due.Add(new DueTab { Key = key, Title = title, Why = "not opened for " + (int)idleMin + " min" });
@@ -421,11 +422,9 @@ class TrayApp : ApplicationContext {
         int lookups = 0, ends = 0;
         foreach (var d in due) {
             if (stopped || ends >= MaxEndsPerMinute || lookups >= 12) break;
-            if (titleCount[d.Title] > 1) {                              // same title twice: only if every copy is due
-                bool allDue = true;
-                for (int i = 1; i <= titleCount[d.Title]; i++) if (!due.Exists(x => x.Key == d.Title + "#" + i)) allDue = false;
-                if (!allDue) continue;
-            }
+            // same title open more than once: end it only when no live copy is active or still within its idle time
+            // (a crashed copy is already ended and has no process, so it never blocks ending the live one)
+            if (protectedTitles.Contains(d.Title)) continue;
             lookups++;
             var found = BrowserTaskManager.FindTab(tm, d.Title);       // pid -> everything that process holds
             if (found.Count == 0) {                                     // asleep (no process): nothing to end, look again later
