@@ -25,7 +25,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 static class Program {
-    public const string Version = "1.5.1";
+    public const string Version = "1.5.2";
 
     [STAThread]
     static void Main(string[] args) {
@@ -185,9 +185,11 @@ static class BrowserTaskManager {
         return result;
     }
 
-    /// title -> process ids, for every tab currently listed. One "Tab:" search (its list then fits one screen),
-    /// cleared straight after so the Task Manager is never left filtered. Used to seed idle clocks at startup.
-    public static Dictionary<string, List<int>> MapTabs(AutomationElement tm) {
+    /// title -> process ids, for every tab currently listed. Filters the list to tabs ("Tab:") and scrolls through it so
+    /// all rows are captured even with many tabs open; the filter is cleared straight after. Used to seed idle clocks
+    /// and to end tabs. The out flag says whether the whole list was read (so callers don't mistake a miss for asleep).
+    public static Dictionary<string, List<int>> MapTabs(AutomationElement tm, out bool complete) {
+        complete = false;
         var map = new Dictionary<string, List<int>>();
         try {
             foreach (AutomationElement t in tm.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TabItem))) {
@@ -201,9 +203,7 @@ static class BrowserTaskManager {
         object vp;
         if (edit == null || grid == null || !edit.TryGetCurrentPattern(ValuePattern.Pattern, out vp)) return map;
         var search = (ValuePattern)vp;
-        try {
-            search.SetValue("Tab:");
-            Thread.Sleep(500);
+        Action collect = delegate () {
             foreach (var r in ReadVisible(grid)) {
                 if (!r.Task.StartsWith("Tab:")) continue;
                 string title = r.Task.Substring(4).Trim();
@@ -211,9 +211,32 @@ static class BrowserTaskManager {
                 if (!map.TryGetValue(title, out l)) { l = new List<int>(); map[title] = l; }
                 if (!l.Contains(r.Pid)) l.Add(r.Pid);
             }
+        };
+        try {
+            search.SetValue("Tab:");
+            Thread.Sleep(450);
+            // find a vertical scroll on the list (or an ancestor) and page through the whole thing
+            ScrollPattern scroll = null;
+            object sp;
+            for (var e = grid; e != null && scroll == null; e = TreeWalker.RawViewWalker.GetParent(e))
+                if (e.TryGetCurrentPattern(ScrollPattern.Pattern, out sp) && ((ScrollPattern)sp).Current.VerticallyScrollable) scroll = (ScrollPattern)sp;
+            if (scroll == null) { collect(); complete = true; return map; }   // no scrollbar: it all fits
+            try { scroll.SetScrollPercent(ScrollPattern.NoScroll, 0); Thread.Sleep(120); } catch { }
+            complete = true;
+            for (int page = 0; page < 60; page++) {
+                collect();
+                double before;
+                try { before = scroll.Current.VerticalScrollPercent; } catch { break; }
+                if (before < 0 || before >= 99.5) break;
+                try { scroll.Scroll(ScrollAmount.NoAmount, ScrollAmount.LargeIncrement); } catch { break; }
+                Thread.Sleep(90);
+                double after;
+                try { after = scroll.Current.VerticalScrollPercent; } catch { break; }
+                if (after <= before) { if (page > 50) complete = false; break; }   // couldn't advance
+            }
         } finally {
             try { search.SetValue(""); } catch { }
-            Thread.Sleep(200);
+            Thread.Sleep(150);
         }
         return map;
     }
@@ -455,11 +478,16 @@ class TrayApp : ApplicationContext {
         };
 
         Dictionary<string, List<int>> map = null;   // title -> process ids, read from the Task Manager at most once per scan
+        bool mapComplete = false, mapDone = false;
+        Func<Dictionary<string, List<int>>> ensureMap = delegate () {
+            if (!mapDone) { mapDone = true; bool c; map = BrowserTaskManager.MapTabs(tm, out c); mapComplete = c; }
+            return map;
+        };
 
         // seed first-seen tabs from when the browser opened/loaded them (their process start time), not from now,
         // so tabs already left idle before Tab Cleaner started are counted from when they were opened
         if (firstSeen.Count > 0 && getTm()) {
-            map = BrowserTaskManager.MapTabs(tm);
+            ensureMap();
             lock (idleSince) {
                 foreach (var fs in firstSeen) {
                     DateTime since = now;                              // asleep / unknown: start now
@@ -498,8 +526,8 @@ class TrayApp : ApplicationContext {
 
         // 2. read the whole tab->process map ONCE, then end the due tabs straight from it (no per-tab search), so a
         //    backlog clears quickly; the Task Manager's filter is already cleared before any process is ended
-        if (map == null) map = BrowserTaskManager.MapTabs(tm);
-        int ends = 0;
+        ensureMap();
+        int ends = 0, fallbacks = 0;
         var doneTitles = new HashSet<string>();
         foreach (var d in due) {
             if (stopped || ends >= MaxEndsPerScan) break;
@@ -507,9 +535,15 @@ class TrayApp : ApplicationContext {
             // (a crashed copy is already ended and has no process, so it never blocks ending the live one)
             if (protectedTitles.Contains(d.Title) || !doneTitles.Add(d.Title)) continue;
             List<int> pids;
-            if (!map.TryGetValue(d.Title, out pids) || pids.Count == 0) {   // asleep (no process): nothing to end
-                lock (idleSince) { TabState st; if (idleSince.TryGetValue(d.Key, out st)) st.Since = now; }
-                continue;
+            if (!map.TryGetValue(d.Title, out pids) || pids.Count == 0) {
+                // not in the map. If the map couldn't read the whole (long) list, look this tab up directly rather than
+                // assuming it's asleep; never reset the idle clock for a tab we simply didn't see, or it would never end.
+                if (!mapComplete && fallbacks < 10) {
+                    fallbacks++;
+                    var found = BrowserTaskManager.FindTab(tm, d.Title);
+                    pids = new List<int>(found.Keys);
+                }
+                if (pids == null || pids.Count == 0) continue;   // truly asleep (no process): leave the clock, skip
             }
             foreach (var pid in pids) {
                 if (stopped || ends >= MaxEndsPerScan) break;
