@@ -5,11 +5,14 @@
 // How it decides (every minute):
 //  1. Only WorkStream's tab strip is read (read-only, like a screen reader). Active = the selected tab of each window;
 //     it is never ended, even while its window is minimised or covered. Every other tab is idle from the moment you
-//     leave it - tabs playing sound and busy tabs included.
-//  2. A tab idle for 30 minutes - or 10 minutes when it uses more than 1.5% of the computer's memory - is due, unless it
-//     is allow-listed ("Google Maps", "Dataminr", ...). Only then is WorkStream's Task Manager used: one search for that
-//     tab's title (cleared straight after) gives its process, which is ended - what the Task Manager's "End task" does.
-//     Embedded frames ("Subframe: ...") are never ended on their own. At most 5 tabs a minute, one at a time.
+//     leave it - tabs playing sound and busy tabs included. The tab strip stays readable while WorkStream is minimised.
+//  2. A tab idle for 15 minutes - or 10 minutes when it uses more than 1.5% of the computer's memory - is due, unless it
+//     is allow-listed ("Google Maps", "Dataminr", ...). Only then is WorkStream's Task Manager used: it gives the tab's
+//     process, which is ended - what the Task Manager's "End task" does. All processes for a title are ended together, so
+//     duplicate copies of a page go at once. Embedded frames ("Subframe: ...") are never ended on their own.
+//     A tab the browser has itself put to sleep has no process and does not appear in the Task Manager; it uses almost no
+//     memory or CPU, so it is left alone. The only tabs kept are the allow-listed ones, the active (selected) tab of each
+//     window, tabs opened or visited within the idle limit, and tabs the browser has already put to sleep.
 
 using System;
 using System.Collections.Generic;
@@ -25,7 +28,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 static class Program {
-    public const string Version = "1.5.2";
+    public const string Version = "1.6.0";
 
     [STAThread]
     static void Main(string[] args) {
@@ -373,15 +376,24 @@ class TrayApp : ApplicationContext {
     // ---- every minute (in the background, so the tray stays responsive):
     //  1. Only the tab strip is read (a read-only view, like a screen reader): the selected tab of each window is
     //     active; every other tab is idle from the moment you leave it (playing sound or busy makes no difference).
-    //  2. Only when a tab is due does Tab Cleaner look it up in WorkStream's Task Manager - one search for that title,
-    //     cleared straight after - and end that tab's process. At most 5 tabs a minute, one at a time.
-    //     (Keeping the Task Manager filtered while many tabs closed is the likely cause of a WorkStream crash.)
+    //     The tab strip and the renderer process list stay readable even when WorkStream is minimised.
+    //  2. A due tab's process is found in WorkStream's Task Manager and ended. When WorkStream is minimised Chromium
+    //     freezes its Task Manager, so the title->process map read while the window was up is remembered and used; a pid
+    //     from it is ended only after it is confirmed to still be a live WorkStream renderer. So idle tabs are ended
+    //     even while WorkStream is minimised, as long as they still have a process (slept tabs have none, so are left).
     class TabState { public DateTime Since; }
     readonly Dictionary<string, TabState> idleSince = new Dictionary<string, TabState>();   // tab (title#n) -> state
     readonly HashSet<string> reported = new HashSet<string>();                             // allow-listed lines logged once
     DateTime lastOpenTry = DateTime.MinValue;
     DateTime scanStarted = DateTime.MinValue;
     const int MaxEndsPerScan = 25;   // clears a big backlog in a scan or two; killed 120 ms apart so the browser copes
+    // When WorkStream is minimised Chromium freezes its Task Manager, so the title->process map can't be read then.
+    // The last good map (read while the window was in use) is kept here and used to end idle tabs while minimised; a
+    // pid from it is only ever killed after checking it is still a live WorkStream renderer, so a stale pid is ignored.
+    readonly object cacheLock = new object();
+    readonly Dictionary<string, List<int>> cachedMap = new Dictionary<string, List<int>>();   // title -> pids, last good read
+    DateTime cacheStamp = DateTime.MinValue;
+    const double CacheMaxHours = 3;   // don't trust a mapping older than this
 
     void Check() {
         if (DateTime.Today != today) { today = DateTime.Today; endedToday = 0; }
@@ -480,7 +492,11 @@ class TrayApp : ApplicationContext {
         Dictionary<string, List<int>> map = null;   // title -> process ids, read from the Task Manager at most once per scan
         bool mapComplete = false, mapDone = false;
         Func<Dictionary<string, List<int>>> ensureMap = delegate () {
-            if (!mapDone) { mapDone = true; bool c; map = BrowserTaskManager.MapTabs(tm, out c); mapComplete = c; }
+            if (!mapDone) {
+                mapDone = true; bool c; map = BrowserTaskManager.MapTabs(tm, out c); mapComplete = c;
+                if (map != null && map.Count > 0)   // a real reading (the window was up): remember it for when it's minimised
+                    lock (cacheLock) { cachedMap.Clear(); foreach (var kv in map) cachedMap[kv.Key] = new List<int>(kv.Value); cacheStamp = now; }
+            }
             return map;
         };
 
@@ -534,21 +550,32 @@ class TrayApp : ApplicationContext {
             // same title open more than once: end only when no live copy is active or still within its idle time
             // (a crashed copy is already ended and has no process, so it never blocks ending the live one)
             if (protectedTitles.Contains(d.Title) || !doneTitles.Add(d.Title)) continue;
+            bool tmReadable = map != null && map.Count > 0;             // false when the window is minimised (frozen TM)
             List<int> pids;
+            bool fromCache = false;
             if (!map.TryGetValue(d.Title, out pids) || pids.Count == 0) {
-                // not in the map. If the map couldn't read the whole (long) list, look this tab up directly rather than
-                // assuming it's asleep; never reset the idle clock for a tab we simply didn't see, or it would never end.
-                if (!mapComplete && fallbacks < 10) {
+                // not in the map. If the map could be read but not the whole (long) list, look this tab up directly.
+                if (tmReadable && !mapComplete && fallbacks < 10) {
                     fallbacks++;
                     var found = BrowserTaskManager.FindTab(tm, d.Title);
                     pids = new List<int>(found.Keys);
                 }
-                if (pids == null || pids.Count == 0) continue;   // truly asleep (no process): leave the clock, skip
+                // if the Task Manager couldn't be read at all (window minimised), fall back to the last good map; each pid
+                // is still checked against the live renderer list below, so a tab that has since slept or closed is skipped
+                if ((pids == null || pids.Count == 0) && !tmReadable) {
+                    lock (cacheLock) {
+                        List<int> cp;
+                        if (cachedMap.TryGetValue(d.Title, out cp) && (now - cacheStamp).TotalHours < CacheMaxHours) { pids = new List<int>(cp); fromCache = true; }
+                    }
+                }
+                // still no process: the browser has put this tab to sleep (almost no memory or CPU, not in the Task
+                // Manager). Leave it; never reset its clock, so it is ended the moment the browser wakes it.
+                if (pids == null || pids.Count == 0) continue;
             }
             foreach (var pid in pids) {
                 if (stopped || ends >= MaxEndsPerScan) break;
-                if (!mem.ContainsKey(pid)) continue;                    // not a tab process
-                string why = d.Why;
+                if (!mem.ContainsKey(pid)) continue;                    // not a live tab process now (stale/closed): skip
+                string why = d.Why + (fromCache ? " (window minimised)" : "");
                 if (d.NeedsMemory) {                                    // not past the full limit yet: only if it's a big tab
                     if (mem[pid] < bigMB) continue;
                     why += ", using " + (int)mem[pid] + " MB";
