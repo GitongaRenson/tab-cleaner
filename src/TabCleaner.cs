@@ -31,7 +31,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 static class Program {
-    public const string Version = "1.2.0";
+    public const string Version = "1.2.1";
 
     [STAThread]
     static void Main(string[] args) {
@@ -116,11 +116,25 @@ static class BrowserTaskManager {
         return tm;
     }
 
-    /// Off-screen and as tall as Windows allows.
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h, int index);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr h, int index, IntPtr value);
+    [ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ITaskbarList { void HrInit(); void AddTab(IntPtr h); void DeleteTab(IntPtr h); void ActivateTab(IntPtr h); void SetActiveAlt(IntPtr h); }
+    [ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090")] class TaskbarList { }
+
+    /// Off-screen, as tall as Windows allows, and without a taskbar button (so WorkStream shows as one window).
     public static void Park(AutomationElement tm) {
         try {
+            IntPtr h = new IntPtr(tm.Current.NativeWindowHandle);
             var r = tm.Current.BoundingRectangle;
-            if (r.Left > -3000) SetWindowPos(new IntPtr(tm.Current.NativeWindowHandle), IntPtr.Zero, -4000, 0, 900, 3000, 0x0014);
+            if (r.Left > -3000) SetWindowPos(h, IntPtr.Zero, -4000, 0, 900, 3000, 0x0014);
+            long ex = GetWindowLongPtr(h, -20).ToInt64();
+            if ((ex & 0x80) == 0 || (ex & 0x40000) != 0) {
+                SetWindowLongPtr(h, -20, new IntPtr((ex | 0x80) & ~0x40000L));      // tool window, not an app window
+                var tb = (ITaskbarList)new TaskbarList();
+                tb.HrInit();
+                tb.DeleteTab(h);
+            }
         } catch { }
     }
 
