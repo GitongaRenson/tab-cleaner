@@ -28,7 +28,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 static class Program {
-    public const string Version = "1.6.0";
+    public const string Version = "1.6.1";
 
     [STAThread]
     static void Main(string[] args) {
@@ -115,11 +115,11 @@ static class BrowserTaskManager {
     public class StripTab { public string Name; public bool Selected; }
 
     /// Every tab in the browsers' tab strips, and which one is selected in each window (= the active tabs).
-    public static List<StripTab> TabStrip(int mainPid) {
+    public static List<StripTab> TabStrip(List<int> mainPids) {
         var tabs = new List<StripTab>();
-        var cond = new PropertyCondition(AutomationElement.ProcessIdProperty, mainPid);
         var tabCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TabItem);
-        foreach (AutomationElement w in AutomationElement.RootElement.FindAll(TreeScope.Children, cond)) {
+        foreach (int mainPid in mainPids)
+        foreach (AutomationElement w in AutomationElement.RootElement.FindAll(TreeScope.Children, new PropertyCondition(AutomationElement.ProcessIdProperty, mainPid))) {
             if (w.Current.Name.StartsWith("Task Manager", StringComparison.OrdinalIgnoreCase)) continue;
             foreach (AutomationElement t in w.FindAll(TreeScope.Descendants, tabCond)) {
                 object sel;
@@ -293,6 +293,7 @@ class TrayApp : ApplicationContext {
     int endedToday = 0;
     DateTime today = DateTime.Today;
     int lastTabCount = 0, lastIdleCount = 0;
+    bool readFailed = false;          // last check could not read WorkStream's tab strip
     Icon iconOn, iconStopped;
 
     public TrayApp(string[] args) {
@@ -420,7 +421,7 @@ class TrayApp : ApplicationContext {
         var t2 = new Thread(delegate () {
             var ended = new List<string>();
             var notes = new List<string>();
-            int[] counts = new int[2];
+            int[] counts = new int[3];     // tabs, idle tabs, 1 = tab strip unreadable
             var triedOpen = new bool[1];
             try { Scan(exe, allowNow, dry, limit, bigLimit, bigMB, mayOpen, ended, notes, counts, triedOpen); }
             catch (Exception e) { notes.Add("Check failed: " + e.Message); }
@@ -437,26 +438,40 @@ class TrayApp : ApplicationContext {
               List<string> ended, List<string> notes, int[] counts, bool[] triedOpen) {
         DateTime now = DateTime.Now;
         // WorkStream's tab-capable processes (renderers, not extensions) and their memory
-        int mainPid = 0;
+        var mains = new List<int>();                    // browser processes (no --type); more than one while WorkStream restarts
+        var parentOf = new Dictionary<int, int>();      // renderer -> the browser process that started it
         var mem = new Dictionary<int, double>();
         var start = new Dictionary<int, DateTime>();   // renderer process start time ~ when the tab was last opened/loaded
-        string q = "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = '" + exe.Replace("'", "") + "'";
+        string q = "SELECT ProcessId, ParentProcessId, CommandLine FROM Win32_Process WHERE Name = '" + exe.Replace("'", "") + "'";
         using (var s = new ManagementObjectSearcher(q))
         foreach (ManagementObject mo in s.Get()) {
             string cmd = (mo["CommandLine"] as string) ?? "";
             int pid = Convert.ToInt32(mo["ProcessId"]);
-            if (cmd.IndexOf("--type=", StringComparison.OrdinalIgnoreCase) < 0) { mainPid = pid; continue; }   // the browser
+            if (cmd.IndexOf("--type=", StringComparison.OrdinalIgnoreCase) < 0) { mains.Add(pid); continue; }   // a browser
             if (cmd.IndexOf("--type=renderer", StringComparison.OrdinalIgnoreCase) < 0) continue;            // GPU, helpers
             if (cmd.IndexOf("--extension-process", StringComparison.OrdinalIgnoreCase) >= 0) continue;       // extensions
+            parentOf[pid] = Convert.ToInt32(mo["ParentProcessId"]);
             try { using (var p = Process.GetProcessById(pid)) { mem[pid] = p.PrivateMemorySize64 / (1024.0 * 1024.0); start[pid] = p.StartTime; } } catch { }
         }
-        if (mainPid == 0) { lock (idleSince) { idleSince.Clear(); reported.Clear(); } return; }   // WorkStream not running
+        if (mains.Count == 0) { lock (idleSince) { idleSince.Clear(); reported.Clear(); } return; }   // WorkStream not running
+        // the live browser = the one that started the most tab processes (an old one still shutting down has none)
+        int mainPid = mains[mains.Count - 1], best = -1;
+        foreach (int m in mains) {
+            int n = 0;
+            foreach (var kv in parentOf) if (kv.Value == m) n++;
+            if (n > best) { best = n; mainPid = m; }
+        }
 
-        // 1. the tab strip: which tab is selected in each window, how long every other tab has been left
-        var strip = BrowserTaskManager.TabStrip(mainPid);
+        // 1. the tab strip of every WorkStream window: which tab is selected in each, how long every other tab has been left
+        var strip = BrowserTaskManager.TabStrip(mains);
         bool anySelected = false;
         foreach (var t in strip) if (t.Selected) anySelected = true;
-        if (!anySelected) return;                                       // can't tell what's active: do nothing
+        if (!anySelected) {                                             // can't tell what's active: end nothing, and say so
+            counts[2] = 1;
+            notes.Add("Could not read WorkStream's tabs (" + mains.Count + " browser process" + (mains.Count == 1 ? "" : "es") + ", "
+                      + strip.Count + " tabs seen, none selected); nothing ended this round");
+            return;
+        }
         // give each tab a stable key and note which are being seen for the first time (no idle clock yet)
         var entries = new List<KeyValuePair<BrowserTaskManager.StripTab, string>>();       // tab -> key "title#n"
         var titleCount = new Dictionary<string, int>();
@@ -633,7 +648,10 @@ class TrayApp : ApplicationContext {
         if (triedOpen) lastOpenTry = DateTime.Now;
         lastTabCount = counts[0];
         lastIdleCount = counts[1];
-        foreach (var n in notes) Log(n);
+        bool failed = counts[2] == 1;
+        foreach (var n in notes) if (!(failed && readFailed && n.StartsWith("Could not read WorkStream's tabs"))) Log(n);   // once, not every minute
+        if (readFailed && !failed) Log("WorkStream's tabs can be read again");
+        readFailed = failed;
         foreach (var e in ended) Log("Ended tab " + e);
         if (ended.Count > 0) {
             endedToday += ended.Count;
@@ -648,6 +666,7 @@ class TrayApp : ApplicationContext {
     string StatusText() {
         string ended = endedToday + " tab" + (endedToday == 1 ? "" : "s") + " ended today";
         if (stopped) return "Stopped. " + ended + ".";
+        if (readFailed) return "Running, but WorkStream's tabs can't be read right now (nothing is ended). " + ended + ".";
         return "Running: " + lastIdleCount + " of " + lastTabCount + " open tabs idle. " + ended + "." + (dryRun ? " DRY RUN" : "");
     }
 
