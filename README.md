@@ -6,21 +6,21 @@ Nothing inside the browser is changed (WorkStream doesn't accept extensions).
 
 ## How it decides (every minute)
 
-1. **Active** = the selected tab of each WorkStream window, read from the tab strip. It is never ended, even while
-   its window is minimised or covered. Every other tab is idle from the moment you leave it, including tabs playing
-   sound and busy tabs.
-2. WorkStream's Task Manager (kept open off-screen, no taskbar button) tells which process holds which tab. Its list
-   only exposes the rows that fit in its window, so Tab Cleaner types `Tab:` in its search box (just the tabs), and
-   searches for any tab still missing by its title. Tabs the browser has already put to sleep have no process and
-   aren't listed.
-   - `Tab: <page title>`: a tab, the only thing Tab Cleaner ends;
-   - `Subframe: https://site/`: something embedded in a tab (ads, videos, maps), never ended on its own, because
-     that breaks the page around it, and it closes anyway when its tab is ended.
-3. A tab idle for **30 minutes**, or **10 minutes** when it uses more than **1.5%** of the computer's memory, is
-   ended, unless its Task Manager name contains an allow-listed word (default `Google Maps, Dataminr, dataminr.com,
-   google.com/maps, maps.google`). Ending = ending exactly that tab's process, which is what End task does.
+1. Only WorkStream's **tab strip** is read (read-only, like a screen reader). **Active** = the selected tab of each
+   window; it is never ended, even while its window is minimised or covered. Every other tab is idle from the moment
+   you leave it, including tabs playing sound and busy tabs.
+2. A tab idle for **30 minutes**, or **10 minutes** when it uses more than **1.5%** of the computer's memory, is due,
+   unless its title contains an allow-listed word (default `Google Maps, Dataminr, dataminr.com, google.com/maps,
+   maps.google`).
+3. Only then is WorkStream's **Task Manager** used (kept open off-screen, no taskbar button): one search for that
+   tab's title, cleared straight after, gives its process (`Tab: <title>` row), which is ended, which is what
+   End task does. Embedded frames (`Subframe: ...`) are never ended on their own. Tabs the browser already put to
+   sleep have no process and are left alone. At most 5 tabs a minute, one at a time.
 
-The idle limit menu also has **1 minute (for testing)**: every tab not selected is ended after a minute.
+Why so gentle: version 1.3.0 kept the Task Manager filtered and re-read it every minute while ending many tabs at
+once; WorkStream's main process then stopped itself (a Chromium internal check, 0x80000003).
+
+The idle limit menu also has **1 minute (for testing)**.
 
 ## Install on any Windows PC
 
