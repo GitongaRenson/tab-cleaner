@@ -1,18 +1,21 @@
 // Tab Cleaner: a taskbar (system tray) app that ends WorkStream Browser tabs left idle for 30 minutes, using the
-// browser's own Task Manager (Shift+Esc) and its "End task" button. Nothing inside the browser is changed.
+// browser's own Task Manager (Shift+Esc) to tell real tabs from things embedded in them. Nothing inside the browser
+// is changed.
 //
 // How it decides:
 //  1. Every minute it looks at WorkStream's tab processes. Chromium drops a process to Idle priority while its tab isn't
 //     on screen and raises it when it is (the tab on screen, tabs in other visible windows and tabs playing sound stay
-//     Normal = active, never ended). A process that has stayed at Idle priority for the whole limit, using almost no
-//     CPU, is due. The tab each window had on screen last is kept too, even while the window is covered.
-//  2. For due processes it reads WorkStream's Task Manager, which names what each process holds:
-//       "Tab: <title>"            a tab (the only kind Tab Cleaner ends)
+//     Normal = active, never ended). A process that has stayed at Idle priority for the whole limit is due, unless it
+//     is busy (using real CPU each minute, e.g. an upload or processing). The tab each window had on screen last is
+//     kept too, even while the window is covered.
+//  2. For due processes it reads WorkStream's Task Manager (the whole list, scrolling through it), which names what
+//     each process holds:
+//       "Tab: <title>"            a tab - the only kind Tab Cleaner ends
 //       "Subframe: https://site/" something embedded inside a tab (ads, videos, maps...) - never ended on its own:
 //                                 ending it breaks the page around it, and it closes anyway when its tab is ended
 //  3. A process holding an allow-listed tab ("Google Maps", "Dataminr", ...) is never ended.
-//  4. Otherwise it selects that row in the Task Manager, checks it is the right process, and presses "End task".
-// The Task Manager window is kept open off-screen so it doesn't get in the way.
+//  4. Otherwise it ends exactly that process - what the Task Manager's "End task" does. (The button itself is not
+//     pressed: with the Task Manager kept off-screen its selection can't be trusted.)
 
 using System;
 using System.Collections.Generic;
@@ -28,42 +31,72 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 static class Program {
+    public const string Version = "1.2.0";
+
     [STAThread]
     static void Main(string[] args) {
+        if (Array.IndexOf(args, "--uninstall") >= 0) { Installer.Uninstall(Array.IndexOf(args, "--quiet") >= 0); return; }
         bool created;
         using (new Mutex(true, "TabCleaner.SingleInstance", out created)) {
-            if (!created) return;                                       // already running in the tray
+            if (!created) {                                             // already running: just say so
+                MessageBox.Show("Tab Cleaner is already running. Right-click its icon in the taskbar's notification area to start or stop it.",
+                                "Tab Cleaner", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
             Application.EnableVisualStyles();
             Application.Run(new TrayApp(args));
         }
     }
 }
 
-class Tracked {
-    public DateTime IdleSince;      // first time seen at Idle priority (not on screen) in this stretch
-    public double CpuAtStart;       // CPU seconds used when that stretch began
+/// Uninstall for the current user (the installer registers "TabCleaner.exe --uninstall" in Apps).
+static class Installer {
+    public const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    public const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\TabCleaner";
+
+    public static void Uninstall(bool quiet) {
+        if (!quiet && MessageBox.Show("Remove Tab Cleaner from this computer?", "Tab Cleaner", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        int me = Process.GetCurrentProcess().Id;
+        foreach (var p in Process.GetProcessesByName("TabCleaner")) { try { if (p.Id != me) { p.Kill(); p.WaitForExit(3000); } } catch { } }
+        try { using (var k = Registry.CurrentUser.OpenSubKey(RunKey, true)) if (k != null) k.DeleteValue("TabCleaner", false); } catch { }
+        try { Registry.CurrentUser.DeleteSubKeyTree(UninstallKey, false); } catch { }
+        foreach (var f in new[] {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Tab Cleaner.lnk"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Tab Cleaner.lnk") })
+            try { if (File.Exists(f)) File.Delete(f); } catch { }
+        // remove the program folder once this process has exited (settings and log are kept in %LOCALAPPDATA%\TabCleaner)
+        string folder = Path.GetDirectoryName(Application.ExecutablePath);
+        if (Path.GetFileName(folder).Equals("TabCleaner", StringComparison.OrdinalIgnoreCase) && folder.IndexOf(@"\Programs\", StringComparison.OrdinalIgnoreCase) >= 0) {
+            var psi = new ProcessStartInfo("cmd.exe", "/c timeout /t 2 /nobreak >nul & rmdir /s /q \"" + folder + "\"");
+            psi.WindowStyle = ProcessWindowStyle.Hidden; psi.CreateNoWindow = true;
+            try { Process.Start(psi); } catch { }
+        }
+        if (!quiet) MessageBox.Show("Tab Cleaner has been removed.", "Tab Cleaner", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
 }
 
-class Due { public int Pid; public int IdleMin; public double Cpu; }
+class Tracked {
+    public DateTime IdleSince;      // first time seen at Idle priority (not on screen) in this stretch
+    public double LastCpu;          // CPU seconds at the previous check (to see if it's busy right now)
+}
 
-class TmRow { public string Task; public int Pid; public AutomationElement TaskCell; public AutomationElement PidCell; }
+class Due { public int Pid; public int IdleMin; public string Why; }
 
-/// WorkStream's own Task Manager (Shift+Esc), read and used through Windows UI Automation.
+class TmRow { public string Task; public int Pid; }
+
+/// WorkStream's own Task Manager (Shift+Esc), read through Windows UI Automation.
 static class BrowserTaskManager {
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
 
-    static AutomationElement Windows(int mainPid, bool taskManager) {
+    public static AutomationElement Find(int mainPid) {
         var cond = new PropertyCondition(AutomationElement.ProcessIdProperty, mainPid);
-        foreach (AutomationElement w in AutomationElement.RootElement.FindAll(TreeScope.Children, cond)) {
-            if (w.Current.Name.StartsWith("Task Manager", StringComparison.OrdinalIgnoreCase) == taskManager) return w;
-        }
+        foreach (AutomationElement w in AutomationElement.RootElement.FindAll(TreeScope.Children, cond))
+            if (w.Current.Name.StartsWith("Task Manager", StringComparison.OrdinalIgnoreCase)) return w;
         return null;
     }
-
-    public static AutomationElement Find(int mainPid) { return Windows(mainPid, true); }
 
     /// Opens the Task Manager (Shift+Esc in the browser), parks it off-screen and gives focus back.
     public static AutomationElement Open(int mainPid) {
@@ -83,7 +116,7 @@ static class BrowserTaskManager {
         return tm;
     }
 
-    /// Off-screen and tall, so every row is laid out (the table only exposes rows that fit in the window).
+    /// Off-screen and as tall as Windows allows.
     public static void Park(AutomationElement tm) {
         try {
             var r = tm.Current.BoundingRectangle;
@@ -91,60 +124,64 @@ static class BrowserTaskManager {
         } catch { }
     }
 
-    public static List<TmRow> Read(AutomationElement tm) {
-        var rows = new List<TmRow>();
+    /// Every row of the list: the table only exposes the rows in view, so it scrolls through all of them.
+    public static List<TmRow> ReadAll(AutomationElement tm) {
+        var all = new List<TmRow>();
+        var seen = new HashSet<string>();
         var grid = tm.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataGrid));
-        if (grid == null) return rows;
+        if (grid == null) return all;
+        ScrollPattern scroll = null;
+        object sp;
+        for (var e = grid; e != null && scroll == null; e = TreeWalker.RawViewWalker.GetParent(e))
+            if (e.TryGetCurrentPattern(ScrollPattern.Pattern, out sp) && ((ScrollPattern)sp).Current.VerticallyScrollable) scroll = (ScrollPattern)sp;
+        if (scroll != null) try { scroll.SetScrollPercent(ScrollPattern.NoScroll, 0); Thread.Sleep(120); } catch { }
+        for (int page = 0; page < 40; page++) {
+            foreach (var r in ReadVisible(grid)) {
+                string key = r.Pid + "|" + r.Task;
+                if (seen.Add(key)) all.Add(r);
+            }
+            if (scroll == null) break;
+            double before;
+            try { before = scroll.Current.VerticalScrollPercent; } catch { break; }
+            if (before < 0 || before >= 99.5) break;
+            try { scroll.Scroll(ScrollAmount.NoAmount, ScrollAmount.LargeIncrement); } catch { break; }
+            Thread.Sleep(120);
+            double after;
+            try { after = scroll.Current.VerticalScrollPercent; } catch { break; }
+            if (after <= before) break;
+        }
+        if (scroll != null) try { scroll.SetScrollPercent(ScrollPattern.NoScroll, 0); } catch { }
+        return all;
+    }
+
+    static List<TmRow> ReadVisible(AutomationElement grid) {
+        var rows = new List<TmRow>();
         var walk = TreeWalker.RawViewWalker;
         int lastPid = 0;
         for (var row = walk.GetFirstChild(grid); row != null; row = walk.GetNextSibling(row)) {
-            var cells = new List<AutomationElement>();
-            for (var c = walk.GetFirstChild(row); c != null; c = walk.GetNextSibling(c)) cells.Add(c);
+            var cells = new List<string>();
+            for (var c = walk.GetFirstChild(row); c != null; c = walk.GetNextSibling(c)) cells.Add(c.Current.Name);
             if (cells.Count < 5) continue;
-            string task = cells[0].Current.Name;
+            string task = cells[0];
             if (task.StartsWith("Column ")) continue;                   // header
-            string pidText = cells[cells.Count - 1].Current.Name;
             int pid;
-            if (int.TryParse(pidText, out pid)) lastPid = pid; else pid = lastPid;   // no ID: same process as the row above
-            rows.Add(new TmRow { Task = task, Pid = pid, TaskCell = cells[0], PidCell = cells[cells.Count - 1] });
+            if (int.TryParse(cells[cells.Count - 1], out pid)) lastPid = pid; else pid = lastPid;   // no ID: same process as above
+            if (pid == 0) continue;                                     // continuation of a process above the view
+            rows.Add(new TmRow { Task = task, Pid = pid });
         }
         return rows;
-    }
-
-    /// Selects the process's row and presses "End task" (after checking the selected row is still that process).
-    /// Returns "" when pressed, otherwise why it couldn't be.
-    public static string EndTask(AutomationElement tm, int pid) {
-        TmRow row = null;
-        foreach (var r in Read(tm)) if (r.Pid == pid && r.PidCell.Current.Name == pid.ToString()) { row = r; break; }
-        if (row == null) return "row not found";
-        object sel;
-        if (!row.TaskCell.TryGetCurrentPattern(SelectionItemPattern.Pattern, out sel)) return "row can't be selected";
-        try { ((SelectionItemPattern)sel).Select(); } catch (Exception e) { return "select failed: " + e.Message; }
-        var btnCond = new AndCondition(new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
-                                       new PropertyCondition(AutomationElement.NameProperty, "End task"));
-        AutomationElement btn = null;
-        for (int i = 0; i < 10; i++) {                                  // wait for the selection and the button
-            Thread.Sleep(100);
-            btn = tm.FindFirst(TreeScope.Descendants, btnCond);
-            if (btn != null && btn.Current.IsEnabled && ((SelectionItemPattern)sel).Current.IsSelected) break;
-        }
-        if (btn == null) return "End task button not found";
-        if (!btn.Current.IsEnabled) return "End task button disabled";
-        if (!((SelectionItemPattern)sel).Current.IsSelected) return "row not selected";
-        if (row.PidCell.Current.Name != pid.ToString()) return "list moved";
-        object inv;
-        if (!btn.TryGetCurrentPattern(InvokePattern.Pattern, out inv)) return "button can't be pressed";
-        try { ((InvokePattern)inv).Invoke(); } catch (Exception e) { return "press failed: " + e.Message; }
-        return "";
     }
 }
 
 class TrayApp : ApplicationContext {
     // ---- settings (%LOCALAPPDATA%\TabCleaner\settings.ini)
     int idleMinutes = 30;
-    bool paused = false;
+    bool stopped = false;
     bool notify = true;
-    double maxCpuSeconds = 5;       // a background tab using more CPU than this during the idle time is still working
+    double busyCpuPerMinute = 6;    // CPU seconds in one minute that count as "still working" (10% of a core)
+    double bigTabPercent = 1.5;     // a tab using more than this share of the computer's memory...
+    int bigTabMinutes = 10;         // ...is ended after this many idle minutes instead
+    double totalMemoryMB = 0;
     List<string> allow = new List<string> { "Google Maps", "Dataminr", "dataminr.com", "google.com/maps", "maps.google" };
     string exeName = "workstream.exe";
     bool dryRun = false;            // --dry-run: only log what would be ended
@@ -155,8 +192,8 @@ class TrayApp : ApplicationContext {
     string IniPath { get { return Path.Combine(dir, "settings.ini"); } }
 
     readonly NotifyIcon tray = new NotifyIcon();
+    readonly ToolStripMenuItem toggleItem = new ToolStripMenuItem();
     readonly ToolStripMenuItem statusItem = new ToolStripMenuItem();
-    readonly ToolStripMenuItem pauseItem = new ToolStripMenuItem("Pause");
     readonly ToolStripMenuItem startupItem = new ToolStripMenuItem("Start with Windows");
     readonly ToolStripMenuItem notifyItem = new ToolStripMenuItem("Show a message when tabs are ended");
     readonly ToolStripMenuItem limitMenu = new ToolStripMenuItem("Idle limit");
@@ -166,12 +203,10 @@ class TrayApp : ApplicationContext {
     readonly Dictionary<int, DateTime> keepUntil = new Dictionary<int, DateTime>();   // checked in the Task Manager: keep
     readonly SynchronizationContext ui;
     volatile bool working = false;
-    int endedToday = 0, keptCount = 0;
+    int endedToday = 0;
     DateTime today = DateTime.Today;
     int lastTabCount = 0, lastIdleCount = 0;
-    Icon iconOn, iconPaused;
-    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    const string RunName = "TabCleaner";
+    Icon iconOn, iconStopped;
 
     public TrayApp(string[] args) {
         Directory.CreateDirectory(dir);
@@ -181,12 +216,20 @@ class TrayApp : ApplicationContext {
             if (args[i] == "--exe" && i + 1 < args.Length) exeName = args[++i];
             else if (args[i] == "--minutes" && i + 1 < args.Length) idleMinutes = int.Parse(args[++i]);
             else if (args[i] == "--dry-run") dryRun = true;
+            else if (args[i] == "--big-minutes" && i + 1 < args.Length) bigTabMinutes = int.Parse(args[++i]);
         }
         iconOn = MakeIcon(false);
-        iconPaused = MakeIcon(true);
+        iconStopped = MakeIcon(true);
+        try {
+            using (var s = new ManagementObjectSearcher("SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"))
+            foreach (ManagementObject mo in s.Get()) totalMemoryMB = Convert.ToDouble(mo["TotalPhysicalMemory"]) / (1024 * 1024);
+        } catch { }
 
         var menu = new ContextMenuStrip();
         ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        toggleItem.Font = new Font(toggleItem.Font, FontStyle.Bold);
+        toggleItem.Click += delegate { SetStopped(!stopped); };
+        menu.Items.Add(toggleItem);
         statusItem.Enabled = false;
         menu.Items.Add(statusItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -198,38 +241,59 @@ class TrayApp : ApplicationContext {
         }
         menu.Items.Add(limitMenu);
         menu.Items.Add("Edit allow list...", null, delegate { SaveSettings(); Process.Start("notepad.exe", "\"" + IniPath + "\""); });
-        pauseItem.Click += delegate { paused = !paused; if (paused) tracked.Clear(); SaveSettings(); RefreshMenu(); Log(paused ? "Paused" : "Resumed"); };
-        menu.Items.Add(pauseItem);
         notifyItem.Click += delegate { notify = !notify; SaveSettings(); RefreshMenu(); };
         menu.Items.Add(notifyItem);
         startupItem.Click += delegate { SetStartup(!IsStartup()); RefreshMenu(); };
         menu.Items.Add(startupItem);
         menu.Items.Add("Open log", null, delegate { if (!File.Exists(LogPath)) File.WriteAllText(LogPath, ""); Process.Start("notepad.exe", "\"" + LogPath + "\""); });
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Exit", null, delegate { tray.Visible = false; Log("Exited"); ExitThread(); });
+        menu.Items.Add("Exit (close Tab Cleaner)", null, delegate { tray.Visible = false; Log("Exited"); ExitThread(); });
         menu.Opening += delegate { RefreshMenu(); };
 
         tray.ContextMenuStrip = menu;
         tray.Visible = true;
-        tray.DoubleClick += delegate { tray.ShowBalloonTip(4000, "Tab Cleaner", StatusText(), ToolTipIcon.Info); };
+        tray.MouseClick += delegate (object s, MouseEventArgs e) {      // left click: show the menu too
+            if (e.Button == MouseButtons.Left) {
+                var mi = typeof(NotifyIcon).GetMethod("ShowContextMenu", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                if (mi != null) mi.Invoke(tray, null);
+            }
+        };
         RefreshMenu();
 
-        Log("Started" + (dryRun ? " (DRY RUN: nothing will be ended)" : "") + ": ends " + exeName + " tabs idle for "
-            + idleMinutes + " minutes; never: " + string.Join(", ", allow.ToArray()));
+        Log("Started v" + Program.Version + (dryRun ? " (DRY RUN: nothing will be ended)" : "") + (stopped ? " (stopped)" : "")
+            + ": ends " + exeName + " tabs idle for " + idleMinutes + " minutes, or " + bigTabMinutes + " minutes when using over "
+            + bigTabPercent + "% of memory (" + (int)BigTabMB + " MB); never: " + string.Join(", ", allow.ToArray()));
+        if (stopped) tray.ShowBalloonTip(4000, "Tab Cleaner", "Tab Cleaner is stopped. Click its icon and choose Start to turn it on.", ToolTipIcon.Info);
         timer.Interval = 60 * 1000;                                     // look once a minute: light on the PC
         timer.Tick += delegate { Check(); };
         timer.Start();
         Check();
     }
 
+    void SetStopped(bool stop) {
+        stopped = stop;
+        tracked.Clear();                                                // idle time counts again from now
+        keepUntil.Clear();
+        SaveSettings();
+        RefreshMenu();
+        Log(stop ? "Stopped" : "Started (idle time counts from now)");
+        tray.ShowBalloonTip(3000, "Tab Cleaner", stop ? "Stopped. No tabs will be ended until you start it again."
+                                                        : "Started. Tabs not opened for " + idleMinutes + " minutes will be ended.", ToolTipIcon.Info);
+        if (!stop) Check();
+    }
+
     // ---- step 1 (every minute, on the tray's thread): which tab processes have been idle long enough
     void Check() {
         if (DateTime.Today != today) { today = DateTime.Today; endedToday = 0; }
         if (File.Exists(IniPath) && File.GetLastWriteTime(IniPath) != iniStamp) {
-            int keepLimit = idleMinutes; LoadSettings(); if (dryRun) idleMinutes = keepLimit;
+            int keepLimit = idleMinutes; bool wasStopped = stopped;
+            LoadSettings();
+            if (dryRun) idleMinutes = keepLimit;
             keepUntil.Clear();
+            if (wasStopped != stopped) tracked.Clear();
             Log("Settings reloaded; never: " + string.Join(", ", allow.ToArray()));
         }
+        if (stopped) { RefreshMenu(); return; }
         if (working) return;
         var seen = new HashSet<int>();
         var due = new List<Due>();
@@ -250,18 +314,22 @@ class TrayApp : ApplicationContext {
                     tabs++;
                     seen.Add(pid);
                     ProcessPriorityClass prio;
-                    double cpu;
-                    try { prio = p.PriorityClass; cpu = p.TotalProcessorTime.TotalSeconds; } catch { continue; }
+                    double cpu, memMB;
+                    try { prio = p.PriorityClass; cpu = p.TotalProcessorTime.TotalSeconds; memMB = p.PrivateMemorySize64 / (1024.0 * 1024.0); } catch { continue; }
                     if (prio != ProcessPriorityClass.Idle) { tracked.Remove(pid); lastOnScreen[pid] = now; continue; }   // active
                     idle++;
                     Tracked t;
-                    if (!tracked.TryGetValue(pid, out t)) { t = new Tracked { IdleSince = now, CpuAtStart = cpu }; tracked[pid] = t; continue; }
-                    double used = cpu - t.CpuAtStart;
-                    if (used > maxCpuSeconds) { t.IdleSince = now; t.CpuAtStart = cpu; continue; }   // still working
+                    if (!tracked.TryGetValue(pid, out t)) { tracked[pid] = new Tracked { IdleSince = now, LastCpu = cpu }; continue; }
+                    double lastMinute = cpu - t.LastCpu;
+                    t.LastCpu = cpu;
+                    if (lastMinute > busyCpuPerMinute) { t.IdleSince = now; continue; }            // busy: still working
                     DateTime until;
                     if (keepUntil.TryGetValue(pid, out until) && until > now) continue;            // already checked: keep
-                    if ((now - t.IdleSince).TotalMinutes >= idleMinutes)
-                        due.Add(new Due { Pid = pid, IdleMin = (int)(now - t.IdleSince).TotalMinutes, Cpu = used });
+                    double idleMin = (now - t.IdleSince).TotalMinutes;
+                    if (idleMin >= idleMinutes)
+                        due.Add(new Due { Pid = pid, IdleMin = (int)idleMin, Why = "not on screen " + (int)idleMin + " min" });
+                    else if (idleMin >= bigTabMinutes && BigTabMB > 0 && memMB >= BigTabMB)   // a big tab: sooner
+                        due.Add(new Due { Pid = pid, IdleMin = (int)idleMin, Why = "not on screen " + (int)idleMin + " min, using " + (int)memMB + " MB" });
                 }
             }
             // the current tab of each window: the tab process(es) seen on screen most recently
@@ -278,7 +346,7 @@ class TrayApp : ApplicationContext {
         lastTabCount = tabs;
         lastIdleCount = idle;
         RefreshMenu();
-        if (due.Count == 0 || paused || mainPid == 0) return;
+        if (due.Count == 0 || mainPid == 0) return;
 
         // ---- step 2 (in the background): look them up in WorkStream's Task Manager and end idle tabs
         working = true;
@@ -295,8 +363,9 @@ class TrayApp : ApplicationContext {
                 else BrowserTaskManager.Park(tm);
                 if (tm == null) { notes.Add("Could not open WorkStream's Task Manager; nothing ended"); }
                 else {
-                    var rows = BrowserTaskManager.Read(tm);
+                    var rows = BrowserTaskManager.ReadAll(tm);
                     foreach (var d in due) {
+                        if (stopped) break;
                         var tasks = new List<string>();
                         foreach (var r in rows) if (r.Pid == d.Pid) tasks.Add(r.Task);
                         string what = string.Join(" | ", tasks.ToArray());
@@ -308,18 +377,12 @@ class TrayApp : ApplicationContext {
                         foreach (var x in tasks) foreach (var a in allowNow)
                             if (hit == null && x.IndexOf(a, StringComparison.OrdinalIgnoreCase) >= 0) hit = a;
                         if (hit != null) { keep.Add(d.Pid); notes.Add("Kept " + d.Pid + " (allow-listed: " + hit + "): " + Short(what)); continue; }
-                        if (dry) { keep.Add(d.Pid); notes.Add("WOULD END " + d.Pid + " (not on screen " + d.IdleMin + " min): " + Short(what)); continue; }
-                        string why = BrowserTaskManager.EndTask(tm, d.Pid);
+                        if (dry) { keep.Add(d.Pid); notes.Add("WOULD END " + d.Pid + " (" + d.Why + "): " + Short(what)); continue; }
                         bool gone = false;
+                        try { using (var p = Process.GetProcessById(d.Pid)) p.Kill(); } catch { }
                         for (int i = 0; i < 12 && !gone; i++) { Thread.Sleep(250); gone = !Alive(d.Pid); }
-                        string how = why == "" ? "End task" : "ended directly (End task: " + why + ")";
-                        if (!gone) {                                     // the same process the Task Manager listed for this tab
-                            if (why == "") how = "ended directly (End task pressed, process still running)";
-                            try { using (var p = Process.GetProcessById(d.Pid)) p.Kill(); } catch { }
-                            for (int i = 0; i < 8 && !gone; i++) { Thread.Sleep(250); gone = !Alive(d.Pid); }
-                        }
-                        if (gone) ended.Add(d.Pid + " (not on screen " + d.IdleMin + " min, " + how + "): " + Short(what));
-                        else notes.Add("Could not end " + d.Pid + " (" + how + "): " + Short(what));
+                        if (gone) ended.Add(d.Pid + " (" + d.Why + "): " + Short(what));
+                        else notes.Add("Could not end " + d.Pid + ": " + Short(what));
                     }
                 }
             } catch (Exception e) { notes.Add("Task Manager step failed: " + e.Message); }
@@ -330,6 +393,8 @@ class TrayApp : ApplicationContext {
         t2.Start();
     }
 
+    double BigTabMB { get { return totalMemoryMB * bigTabPercent / 100.0; } }
+
     static bool Alive(int pid) {
         try { using (var p = Process.GetProcessById(pid)) return !p.HasExited; } catch { return false; }
     }
@@ -338,60 +403,58 @@ class TrayApp : ApplicationContext {
     void Finished(List<string> ended, List<string> notes, List<int> keep) {
         working = false;
         foreach (var pid in keep) keepUntil[pid] = DateTime.Now.AddMinutes(10);         // look again in 10 minutes
-        keptCount = keepUntil.Count;
         foreach (var n in notes) Log(n);
         foreach (var e in ended) Log("Ended tab " + e);
         if (ended.Count > 0) {
             endedToday += ended.Count;
             if (notify) tray.ShowBalloonTip(5000, "Tab Cleaner",
-                "Ended " + ended.Count + " idle tab" + (ended.Count == 1 ? "" : "s") + " (not opened for " + idleMinutes + "+ minutes). Reload a tab to bring it back.",
-                ToolTipIcon.Info);
+                "Ended " + ended.Count + " idle tab" + (ended.Count == 1 ? "" : "s") + ". Reload a tab to bring it back.", ToolTipIcon.Info);
         }
         RefreshMenu();
     }
 
     // ---- menu and icon
     string StatusText() {
-        string ended = endedToday + " ended today";
-        if (paused) return "Paused. " + ended + ".";
-        return lastTabCount + " tab processes, " + lastIdleCount + " not on screen. " + ended + ". Limit " + idleMinutes + " min."
-             + (dryRun ? " DRY RUN" : "");
+        string ended = endedToday + " tab" + (endedToday == 1 ? "" : "s") + " ended today";
+        if (stopped) return "Stopped. " + ended + ".";
+        return "Running: " + lastIdleCount + " of " + lastTabCount + " tab processes not on screen. " + ended + "." + (dryRun ? " DRY RUN" : "");
     }
 
     void RefreshMenu() {
+        toggleItem.Text = stopped ? "Start Tab Cleaner" : "Stop Tab Cleaner";
         statusItem.Text = StatusText();
-        pauseItem.Text = paused ? "Resume" : "Pause";
         notifyItem.Checked = notify;
         startupItem.Checked = IsStartup();
         foreach (ToolStripMenuItem it in limitMenu.DropDownItems) it.Checked = it.Text == idleMinutes + " minutes";
-        limitMenu.Text = "Idle limit: " + idleMinutes + " minutes";
-        tray.Icon = paused ? iconPaused : iconOn;
-        string tip = "Tab Cleaner: " + StatusText();
+        limitMenu.Text = "Idle limit: " + idleMinutes + " minutes (" + bigTabMinutes + " for tabs over " + bigTabPercent + "% memory)";
+        tray.Icon = stopped ? iconStopped : iconOn;
+        string tip = "Tab Cleaner: " + (stopped ? "stopped" : "running, " + idleMinutes + " min limit") + ", " + endedToday + " ended today";
         tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
     }
 
-    /// Small original icon: a browser tab with a clock, grey when paused.
-    static Icon MakeIcon(bool paused) {
+    /// Small original icon: a browser tab with a clock, grey when stopped.
+    static Icon MakeIcon(bool off) {
         var bmp = new Bitmap(32, 32);
         using (var g = Graphics.FromImage(bmp)) {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(Color.Transparent);
-            Color main = paused ? Color.FromArgb(150, 150, 150) : Color.FromArgb(32, 132, 230);
+            Color main = off ? Color.FromArgb(150, 150, 150) : Color.FromArgb(32, 132, 230);
             using (var b = new SolidBrush(main)) { g.FillRectangle(b, 2, 9, 28, 20); g.FillRectangle(b, 2, 4, 13, 7); }
             using (var w = new SolidBrush(Color.White)) g.FillEllipse(w, 9, 12, 14, 14);
             using (var pen = new Pen(main, 2f)) { g.DrawLine(pen, 16, 19, 16, 14); g.DrawLine(pen, 16, 19, 20, 21); }
+            if (off) using (var red = new Pen(Color.FromArgb(220, 60, 60), 3f)) g.DrawLine(red, 4, 28, 28, 4);
         }
         return Icon.FromHandle(bmp.GetHicon());
     }
 
     // ---- start with Windows (current user only)
     bool IsStartup() {
-        using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue(RunName) != null;
+        using (var k = Registry.CurrentUser.OpenSubKey(Installer.RunKey)) return k != null && k.GetValue("TabCleaner") != null;
     }
     void SetStartup(bool on) {
-        using (var k = Registry.CurrentUser.CreateSubKey(RunKey)) {
-            if (on) k.SetValue(RunName, "\"" + Application.ExecutablePath + "\"");
-            else k.DeleteValue(RunName, false);
+        using (var k = Registry.CurrentUser.CreateSubKey(Installer.RunKey)) {
+            if (on) k.SetValue("TabCleaner", "\"" + Application.ExecutablePath + "\"");
+            else k.DeleteValue("TabCleaner", false);
         }
         Log(on ? "Will start with Windows" : "Will not start with Windows");
     }
@@ -406,9 +469,12 @@ class TrayApp : ApplicationContext {
             if (kv.Length != 2) continue;
             string k = kv[0].Trim(), v = kv[1].Trim();
             if (k == "idleMinutes") int.TryParse(v, out idleMinutes);
-            else if (k == "paused") paused = v == "true";
+            else if (k == "stopped" || k == "paused") stopped = v == "true";
             else if (k == "notify") notify = v != "false";
-            else if (k == "maxCpuSeconds") double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out maxCpuSeconds);
+            else if (k == "busyCpuPerMinute") double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out busyCpuPerMinute);
+            else if (k == "browser" && v.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) exeName = v;
+            else if (k == "bigTabPercent") double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out bigTabPercent);
+            else if (k == "bigTabMinutes") int.TryParse(v, out bigTabMinutes);
             else if (k == "allow") {
                 allow = new List<string>();
                 foreach (var a in v.Split(',')) {
@@ -428,8 +494,13 @@ class TrayApp : ApplicationContext {
           + "# allow: a tab is never ended if its name in WorkStream's Task Manager (\"Tab: <page title>\") or a site embedded\r\n"
           + "# in it contains any of these words (comma-separated, not case-sensitive).\r\n"
           + "allow=" + string.Join(", ", allow.ToArray()) + "\r\n"
-          + "idleMinutes=" + idleMinutes + "\r\npaused=" + (paused ? "true" : "false") + "\r\nnotify=" + (notify ? "true" : "false")
-          + "\r\nmaxCpuSeconds=" + maxCpuSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\r\n");
+          + "idleMinutes=" + idleMinutes + "\r\nstopped=" + (stopped ? "true" : "false") + "\r\nnotify=" + (notify ? "true" : "false") + "\r\n"
+          + "# a background tab using more CPU seconds than this in a minute is still working and is not ended\r\n"
+          + "busyCpuPerMinute=" + busyCpuPerMinute.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\r\n"
+          + "# a tab using more than bigTabPercent % of the computer's memory is ended after bigTabMinutes idle minutes\r\n"
+          + "bigTabPercent=" + bigTabPercent.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\r\n"
+          + "bigTabMinutes=" + bigTabMinutes + "\r\n"
+          + "browser=" + exeName + "\r\n");
         iniStamp = File.GetLastWriteTime(IniPath);
     }
     void Log(string msg) {
