@@ -28,7 +28,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 static class Program {
-    public const string Version = "1.6.1";
+    public const string Version = "1.6.2";
 
     [STAThread]
     static void Main(string[] args) {
@@ -88,21 +88,37 @@ static class BrowserTaskManager {
         return null;
     }
 
-    /// Opens the Task Manager (Shift+Esc in the browser), parks it off-screen and gives focus back.
-    public static AutomationElement Open(int mainPid) {
-        IntPtr previous = GetForegroundWindow();
-        IntPtr main;
-        try { using (var p = Process.GetProcessById(mainPid)) main = p.MainWindowHandle; } catch { return null; }
-        if (main == IntPtr.Zero) return null;
-        keybd_event(0x12, 0, 0, UIntPtr.Zero); keybd_event(0x12, 0, 2, UIntPtr.Zero);   // lets Windows hand over focus
-        SetForegroundWindow(main);
-        Thread.Sleep(400);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO lii);
+
+    /// Milliseconds since the last key press or mouse move anywhere on the PC.
+    static long IdleMs() {
+        var lii = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO)) };
+        if (!GetLastInputInfo(ref lii)) return 0;
+        return (long)(uint)Environment.TickCount - lii.dwTime;
+    }
+
+    /// Opens the Task Manager (Shift+Esc in the browser) and parks it off-screen - but ONLY when WorkStream is already
+    /// the window you are using, so the cursor is never pulled away from another app, and only after a 2-second pause
+    /// in typing so the key press never lands in the middle of what you type.
+    /// state: 0 = WorkStream not in front, 1 = you were typing (nothing sent), 2 = Shift+Esc sent.
+    public static AutomationElement Open(List<int> mainPids, int mainPid, out int state) {
+        state = 0;
+        IntPtr fg = GetForegroundWindow();
+        uint fgPid;
+        if (fg == IntPtr.Zero || GetWindowThreadProcessId(fg, out fgPid) == 0 || !mainPids.Contains((int)fgPid)) return null;
+        state = 1;
+        if (IdleMs() < 2000) return null;                                 // you are typing: try at the next check
+        state = 2;
         keybd_event(0x10, 0, 0, UIntPtr.Zero); keybd_event(0x1B, 0, 0, UIntPtr.Zero);  // Shift+Esc
         keybd_event(0x1B, 0, 2, UIntPtr.Zero); keybd_event(0x10, 0, 2, UIntPtr.Zero);
         AutomationElement tm = null;
-        for (int i = 0; i < 24 && tm == null; i++) { Thread.Sleep(250); tm = Find(mainPid); }
+        for (int i = 0; i < 24 && tm == null; i++) { Thread.Sleep(250); tm = Find((int)fgPid); }
+        if (tm == null) for (int i = 0; i < 4 && tm == null; i++) { Thread.Sleep(250); tm = Find(mainPid); }
         if (tm != null) Park(tm);
-        if (previous != IntPtr.Zero) SetForegroundWindow(previous);
+        SetForegroundWindow(fg);                                          // back to the WorkStream window you were in
+        try { AutomationElement.FromHandle(fg).SetFocus(); } catch { }
         return tm;
     }
 
@@ -386,6 +402,7 @@ class TrayApp : ApplicationContext {
     readonly Dictionary<string, TabState> idleSince = new Dictionary<string, TabState>();   // tab (title#n) -> state
     readonly HashSet<string> reported = new HashSet<string>();                             // allow-listed lines logged once
     DateTime lastOpenTry = DateTime.MinValue;
+    volatile bool tmWaitLogged = false;   // "reopened when you are in WorkStream" logged once
     DateTime scanStarted = DateTime.MinValue;
     const int MaxEndsPerScan = 25;   // clears a big backlog in a scan or two; killed 120 ms apart so the browser copes
     // When WorkStream is minimised Chromium freezes its Task Manager, so the title->process map can't be read then.
@@ -494,13 +511,19 @@ class TrayApp : ApplicationContext {
         Func<bool> getTm = delegate () {                               // open WorkStream's Task Manager once, lazily
             if (haveTm) return tm != null;
             haveTm = true;
-            tm = BrowserTaskManager.Find(mainPid);
-            if (tm != null) { BrowserTaskManager.Park(tm); return true; }
+            foreach (int m in mains) if (tm == null) tm = BrowserTaskManager.Find(m);
+            if (tm != null) { BrowserTaskManager.Park(tm); tmWaitLogged = false; return true; }
             if (!mayOpen) return false;
-            triedOpen[0] = true;
-            tm = BrowserTaskManager.Open(mainPid);
-            if (tm == null) notes.Add("Could not open WorkStream's Task Manager; will try again in 10 minutes");
-            else notes.Add("Opened WorkStream's Task Manager (kept off-screen, no taskbar button)");
+            int state;
+            tm = BrowserTaskManager.Open(mains, mainPid, out state);
+            if (tm == null && state == 0) {                              // you're in another app: never take the cursor from it
+                if (!tmWaitLogged) notes.Add("WorkStream's Task Manager is closed; it is reopened the next time you are in WorkStream (the cursor is never taken from other apps)");
+                tmWaitLogged = true;
+                return false;
+            }
+            if (tm == null && state == 1) return false;                // you were typing: nothing sent, try at the next check
+            if (tm == null) { triedOpen[0] = true; notes.Add("Could not open WorkStream's Task Manager; will try again in 10 minutes"); }
+            else { tmWaitLogged = false; notes.Add("Opened WorkStream's Task Manager while you were in WorkStream (kept off-screen, no taskbar button)"); }
             return tm != null;
         };
 
@@ -508,7 +531,9 @@ class TrayApp : ApplicationContext {
         bool mapComplete = false, mapDone = false;
         Func<Dictionary<string, List<int>>> ensureMap = delegate () {
             if (!mapDone) {
-                mapDone = true; bool c; map = BrowserTaskManager.MapTabs(tm, out c); mapComplete = c;
+                mapDone = true; bool c = false;
+                map = tm != null ? BrowserTaskManager.MapTabs(tm, out c) : new Dictionary<string, List<int>>();   // no Task Manager: the remembered map is used
+                mapComplete = c;
                 if (map != null && map.Count > 0)   // a real reading (the window was up): remember it for when it's minimised
                     lock (cacheLock) { cachedMap.Clear(); foreach (var kv in map) cachedMap[kv.Key] = new List<int>(kv.Value); cacheStamp = now; }
             }
@@ -553,7 +578,7 @@ class TrayApp : ApplicationContext {
             reported.RemoveWhere(k => !seen.Contains(k));
         }
         if (due.Count == 0) return;                                     // nothing due: the Task Manager isn't touched past seeding
-        if (!getTm()) return;                                          // couldn't reach the Task Manager this round
+        getTm();                                                       // if it can't be reached, the remembered map is used below
 
         // 2. read the whole tab->process map ONCE, then end the due tabs straight from it (no per-tab search), so a
         //    backlog clears quickly; the Task Manager's filter is already cleared before any process is ended
