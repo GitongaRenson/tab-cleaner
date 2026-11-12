@@ -25,7 +25,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 static class Program {
-    public const string Version = "1.4.2";
+    public const string Version = "1.5.0";
 
     [STAThread]
     static void Main(string[] args) {
@@ -185,6 +185,39 @@ static class BrowserTaskManager {
         return result;
     }
 
+    /// title -> process ids, for every tab currently listed. One "Tab:" search (its list then fits one screen),
+    /// cleared straight after so the Task Manager is never left filtered. Used to seed idle clocks at startup.
+    public static Dictionary<string, List<int>> MapTabs(AutomationElement tm) {
+        var map = new Dictionary<string, List<int>>();
+        try {
+            foreach (AutomationElement t in tm.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TabItem))) {
+                object sel;
+                if (t.Current.Name == "Tabs & extensions" && t.TryGetCurrentPattern(SelectionItemPattern.Pattern, out sel) && !((SelectionItemPattern)sel).Current.IsSelected)
+                    ((SelectionItemPattern)sel).Select();
+            }
+        } catch { }
+        var edit = tm.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
+        var grid = tm.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataGrid));
+        object vp;
+        if (edit == null || grid == null || !edit.TryGetCurrentPattern(ValuePattern.Pattern, out vp)) return map;
+        var search = (ValuePattern)vp;
+        try {
+            search.SetValue("Tab:");
+            Thread.Sleep(500);
+            foreach (var r in ReadVisible(grid)) {
+                if (!r.Task.StartsWith("Tab:")) continue;
+                string title = r.Task.Substring(4).Trim();
+                List<int> l;
+                if (!map.TryGetValue(title, out l)) { l = new List<int>(); map[title] = l; }
+                if (!l.Contains(r.Pid)) l.Add(r.Pid);
+            }
+        } finally {
+            try { search.SetValue(""); } catch { }
+            Thread.Sleep(200);
+        }
+        return map;
+    }
+
     static List<TmRow> ReadVisible(AutomationElement grid) {
         var rows = new List<TmRow>();
         var walk = TreeWalker.RawViewWalker;
@@ -220,6 +253,7 @@ class TrayApp : ApplicationContext {
     readonly string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TabCleaner");
     string LogPath { get { return Path.Combine(dir, "log.txt"); } }
     string IniPath { get { return Path.Combine(dir, "settings.ini"); } }
+    string StatePath { get { return Path.Combine(dir, "idle-state.txt"); } }
 
     readonly NotifyIcon tray = new NotifyIcon();
     readonly ToolStripMenuItem toggleItem = new ToolStripMenuItem();
@@ -239,6 +273,7 @@ class TrayApp : ApplicationContext {
         Directory.CreateDirectory(dir);
         if (!File.Exists(IniPath)) SaveSettings();
         LoadSettings();
+        LoadState();   // idle clocks remembered from the last run, so a restart doesn't reset them
         for (int i = 0; i < args.Length; i++) {                         // testing switches (not saved)
             if (args[i] == "--exe" && i + 1 < args.Length) exeName = args[++i];
             else if (args[i] == "--minutes" && i + 1 < args.Length) idleMinutes = int.Parse(args[++i]);
@@ -322,7 +357,8 @@ class TrayApp : ApplicationContext {
     readonly Dictionary<string, TabState> idleSince = new Dictionary<string, TabState>();   // tab (title#n) -> state
     readonly HashSet<string> reported = new HashSet<string>();                             // allow-listed lines logged once
     DateTime lastOpenTry = DateTime.MinValue;
-    const int MaxEndsPerMinute = 5;
+    DateTime scanStarted = DateTime.MinValue;
+    const int MaxEndsPerScan = 25;   // clears a big backlog in a scan or two; killed 120 ms apart so the browser copes
 
     void Check() {
         if (DateTime.Today != today) { today = DateTime.Today; endedToday = 0; }
@@ -334,8 +370,12 @@ class TrayApp : ApplicationContext {
             Log("Settings reloaded; never: " + string.Join(", ", allow.ToArray()));
         }
         if (stopped) { RefreshMenu(); return; }
-        if (working) return;
+        if (working) {                                                   // a previous scan is still going
+            if ((DateTime.Now - scanStarted).TotalSeconds < 150) return;
+            Log("Previous check was still running after 150 s; starting a fresh one.");   // watchdog: never freeze
+        }
         working = true;
+        scanStarted = DateTime.Now;
         var allowNow = new List<string>(allow);
         bool dry = dryRun;
         int limit = idleMinutes, bigLimit = Math.Min(bigTabMinutes, idleMinutes);
@@ -346,10 +386,10 @@ class TrayApp : ApplicationContext {
             var ended = new List<string>();
             var notes = new List<string>();
             int[] counts = new int[2];
-            bool triedOpen = false;
-            try { Scan(exe, allowNow, dry, limit, bigLimit, bigMB, mayOpen, ended, notes, counts, ref triedOpen); }
+            var triedOpen = new bool[1];
+            try { Scan(exe, allowNow, dry, limit, bigLimit, bigMB, mayOpen, ended, notes, counts, triedOpen); }
             catch (Exception e) { notes.Add("Check failed: " + e.Message); }
-            ui.Post(delegate { Finished(ended, notes, counts, triedOpen); }, null);
+            ui.Post(delegate { Finished(ended, notes, counts, triedOpen[0]); }, null);
         });
         t2.IsBackground = true;
         t2.SetApartmentState(ApartmentState.MTA);                       // UI Automation works best off the UI thread
@@ -359,11 +399,12 @@ class TrayApp : ApplicationContext {
     class DueTab { public string Key, Title, Why; public bool NeedsMemory; }
 
     void Scan(string exe, List<string> allowNow, bool dry, int limit, int bigLimit, double bigMB, bool mayOpen,
-              List<string> ended, List<string> notes, int[] counts, ref bool triedOpen) {
+              List<string> ended, List<string> notes, int[] counts, bool[] triedOpen) {
         DateTime now = DateTime.Now;
         // WorkStream's tab-capable processes (renderers, not extensions) and their memory
         int mainPid = 0;
         var mem = new Dictionary<int, double>();
+        var start = new Dictionary<int, DateTime>();   // renderer process start time ~ when the tab was last opened/loaded
         string q = "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = '" + exe.Replace("'", "") + "'";
         using (var s = new ManagementObjectSearcher(q))
         foreach (ManagementObject mo in s.Get()) {
@@ -372,7 +413,7 @@ class TrayApp : ApplicationContext {
             if (cmd.IndexOf("--type=", StringComparison.OrdinalIgnoreCase) < 0) { mainPid = pid; continue; }   // the browser
             if (cmd.IndexOf("--type=renderer", StringComparison.OrdinalIgnoreCase) < 0) continue;            // GPU, helpers
             if (cmd.IndexOf("--extension-process", StringComparison.OrdinalIgnoreCase) >= 0) continue;       // extensions
-            try { using (var p = Process.GetProcessById(pid)) mem[pid] = p.PrivateMemorySize64 / (1024.0 * 1024.0); } catch { }
+            try { using (var p = Process.GetProcessById(pid)) { mem[pid] = p.PrivateMemorySize64 / (1024.0 * 1024.0); start[pid] = p.StartTime; } } catch { }
         }
         if (mainPid == 0) { lock (idleSince) { idleSince.Clear(); reported.Clear(); } return; }   // WorkStream not running
 
@@ -381,19 +422,61 @@ class TrayApp : ApplicationContext {
         bool anySelected = false;
         foreach (var t in strip) if (t.Selected) anySelected = true;
         if (!anySelected) return;                                       // can't tell what's active: do nothing
-        var due = new List<DueTab>();
+        // give each tab a stable key and note which are being seen for the first time (no idle clock yet)
+        var entries = new List<KeyValuePair<BrowserTaskManager.StripTab, string>>();       // tab -> key "title#n"
         var titleCount = new Dictionary<string, int>();
+        var seen = new HashSet<string>();
+        var firstSeen = new List<KeyValuePair<string, string>>();       // key -> title, first time seen and not selected
+        foreach (var t in strip) {
+            string title = BrowserTaskManager.CleanTitle(t.Name);
+            if (title.Length == 0) continue;
+            int n; titleCount.TryGetValue(title, out n); titleCount[title] = ++n;
+            string key = title + "#" + n;
+            seen.Add(key);
+            entries.Add(new KeyValuePair<BrowserTaskManager.StripTab, string>(t, key));
+            if (!t.Name.EndsWith(" - Crashed") && !t.Selected) {
+                lock (idleSince) if (!idleSince.ContainsKey(key)) firstSeen.Add(new KeyValuePair<string, string>(key, title));
+            }
+        }
+
+        AutomationElement tm = null;
+        bool haveTm = false;
+        Func<bool> getTm = delegate () {                               // open WorkStream's Task Manager once, lazily
+            if (haveTm) return tm != null;
+            haveTm = true;
+            tm = BrowserTaskManager.Find(mainPid);
+            if (tm != null) { BrowserTaskManager.Park(tm); return true; }
+            if (!mayOpen) return false;
+            triedOpen[0] = true;
+            tm = BrowserTaskManager.Open(mainPid);
+            if (tm == null) notes.Add("Could not open WorkStream's Task Manager; will try again in 10 minutes");
+            else notes.Add("Opened WorkStream's Task Manager (kept off-screen, no taskbar button)");
+            return tm != null;
+        };
+
+        Dictionary<string, List<int>> map = null;   // title -> process ids, read from the Task Manager at most once per scan
+
+        // seed first-seen tabs from when the browser opened/loaded them (their process start time), not from now,
+        // so tabs already left idle before Tab Cleaner started are counted from when they were opened
+        if (firstSeen.Count > 0 && getTm()) {
+            map = BrowserTaskManager.MapTabs(tm);
+            lock (idleSince) {
+                foreach (var fs in firstSeen) {
+                    DateTime since = now;                              // asleep / unknown: start now
+                    List<int> pids;
+                    if (map.TryGetValue(fs.Value, out pids)) {
+                        foreach (var pid in pids) { DateTime s2; if (start.TryGetValue(pid, out s2) && s2 < since) since = s2; }
+                    }
+                    if (!idleSince.ContainsKey(fs.Key)) idleSince[fs.Key] = new TabState { Since = since };
+                }
+            }
+        }
+
+        var due = new List<DueTab>();
         var protectedTitles = new HashSet<string>();   // a title with a live copy that is active or not yet idle: never end it
         lock (idleSince) {
-            var seen = new HashSet<string>();
-            foreach (var t in strip) {
-                string title = BrowserTaskManager.CleanTitle(t.Name);
-                if (title.Length == 0) continue;
-                int n;
-                titleCount.TryGetValue(title, out n);
-                titleCount[title] = ++n;
-                string key = title + "#" + n;
-                seen.Add(key);
+            foreach (var e in entries) {
+                var t = e.Key; string key = e.Value; string title = BrowserTaskManager.CleanTitle(t.Name);
                 if (t.Name.EndsWith(" - Crashed")) continue;            // already ended: no process, ignore it
                 counts[0]++;
                 if (t.Selected) { idleSince.Remove(key); protectedTitles.Add(title); continue; }   // active: keep this title
@@ -410,49 +493,37 @@ class TrayApp : ApplicationContext {
             foreach (var k in new List<string>(idleSince.Keys)) if (!seen.Contains(k)) idleSince.Remove(k);   // closed tabs
             reported.RemoveWhere(k => !seen.Contains(k));
         }
-        if (due.Count == 0) return;                                     // nothing due: the Task Manager isn't touched
+        if (due.Count == 0) return;                                     // nothing due: the Task Manager isn't touched past seeding
+        if (!getTm()) return;                                          // couldn't reach the Task Manager this round
 
-        // 2. look the due tabs up in WorkStream's Task Manager, one title at a time, and end them
-        var tm = BrowserTaskManager.Find(mainPid);
-        if (tm == null) {
-            if (!mayOpen) return;
-            triedOpen = true;
-            tm = BrowserTaskManager.Open(mainPid);
-            if (tm == null) { notes.Add("Could not open WorkStream's Task Manager; will try again in 10 minutes"); return; }
-            notes.Add("Opened WorkStream's Task Manager (kept off-screen, no taskbar button)");
-        } else BrowserTaskManager.Park(tm);
-
-        int lookups = 0, ends = 0;
+        // 2. read the whole tab->process map ONCE, then end the due tabs straight from it (no per-tab search), so a
+        //    backlog clears quickly; the Task Manager's filter is already cleared before any process is ended
+        if (map == null) map = BrowserTaskManager.MapTabs(tm);
+        int ends = 0;
+        var doneTitles = new HashSet<string>();
         foreach (var d in due) {
-            if (stopped || ends >= MaxEndsPerMinute || lookups >= 12) break;
-            // same title open more than once: end it only when no live copy is active or still within its idle time
+            if (stopped || ends >= MaxEndsPerScan) break;
+            // same title open more than once: end only when no live copy is active or still within its idle time
             // (a crashed copy is already ended and has no process, so it never blocks ending the live one)
-            if (protectedTitles.Contains(d.Title)) continue;
-            lookups++;
-            var found = BrowserTaskManager.FindTab(tm, d.Title);       // pid -> everything that process holds
-            if (found.Count == 0) {                                     // asleep (no process): nothing to end, look again later
+            if (protectedTitles.Contains(d.Title) || !doneTitles.Add(d.Title)) continue;
+            List<int> pids;
+            if (!map.TryGetValue(d.Title, out pids) || pids.Count == 0) {   // asleep (no process): nothing to end
                 lock (idleSince) { TabState st; if (idleSince.TryGetValue(d.Key, out st)) st.Since = now; }
                 continue;
             }
-            foreach (var kv in found) {
-                int pid = kv.Key;
-                string what = Short(string.Join(" | ", kv.Value.ToArray()));
+            foreach (var pid in pids) {
+                if (stopped || ends >= MaxEndsPerScan) break;
                 if (!mem.ContainsKey(pid)) continue;                    // not a tab process
-                string hit = null;
-                foreach (var x in kv.Value) if (hit == null) hit = Allowed(x, allowNow);   // e.g. an embedded Dataminr page
-                if (hit != null) { if (reported.Add(d.Key)) notes.Add("Kept " + pid + " (allow-listed: " + hit + "): " + what); continue; }
                 string why = d.Why;
-                if (d.NeedsMemory) {                                    // not 30 min yet: only if it's a big tab
+                if (d.NeedsMemory) {                                    // not past the full limit yet: only if it's a big tab
                     if (mem[pid] < bigMB) continue;
                     why += ", using " + (int)mem[pid] + " MB";
                 }
-                if (dry) { if (reported.Add(d.Key)) notes.Add("WOULD END " + pid + " (" + why + "): " + what); continue; }
-                bool gone = false;
-                try { using (var p = Process.GetProcessById(pid)) p.Kill(); } catch { }
-                for (int i = 0; i < 12 && !gone; i++) { Thread.Sleep(250); gone = !Alive(pid); }
-                if (gone) { ended.Add(pid + " (" + why + "): " + what); ends++; lock (idleSince) idleSince.Remove(d.Key); }
-                else notes.Add("Could not end " + pid + ": " + what);
-                Thread.Sleep(1000);                                     // one at a time, gently
+                if (dry) { if (reported.Add(d.Key)) notes.Add("WOULD END " + pid + " (" + why + "): " + Short(d.Title)); continue; }
+                try { using (var p = Process.GetProcessById(pid)) p.Kill(); ended.Add(pid + " (" + why + "): " + Short(d.Title)); ends++; }
+                catch (Exception ex) { notes.Add("Could not end " + pid + ": " + ex.Message); }
+                lock (idleSince) idleSince.Remove(d.Key);
+                Thread.Sleep(120);                                      // light pacing, so the browser isn't hit all at once
             }
         }
     }
@@ -460,6 +531,33 @@ class TrayApp : ApplicationContext {
     static string Allowed(string text, List<string> allowNow) {
         foreach (var a in allowNow) if (text.IndexOf(a, StringComparison.OrdinalIgnoreCase) >= 0) return a;
         return null;
+    }
+
+    // ---- idle clocks kept on disk, so closing and reopening Tab Cleaner (or a Windows restart) doesn't reset them
+    void LoadState() {
+        try {
+            if (!File.Exists(StatePath)) return;
+            DateTime now = DateTime.Now;
+            foreach (var line in File.ReadAllLines(StatePath)) {
+                int tab = line.IndexOf('\t');
+                if (tab <= 0) continue;
+                long ticks;
+                if (!long.TryParse(line.Substring(0, tab), out ticks)) continue;
+                var when = new DateTime(ticks);
+                if (when > now || (now - when).TotalDays > 7) continue;      // ignore the far future or very stale
+                idleSince[line.Substring(tab + 1)] = new TabState { Since = when };
+            }
+        } catch { }
+    }
+    void SaveState() {
+        try {
+            var sb = new System.Text.StringBuilder();
+            lock (idleSince) foreach (var kv in idleSince) {
+                string key = kv.Key.Replace("\r", " ").Replace("\n", " ");
+                sb.Append(kv.Value.Since.Ticks).Append('\t').Append(key).Append("\r\n");
+            }
+            File.WriteAllText(StatePath, sb.ToString());
+        } catch { }
     }
 
     double BigTabMB { get { return totalMemoryMB * bigTabPercent / 100.0; } }
@@ -481,6 +579,7 @@ class TrayApp : ApplicationContext {
             if (notify) tray.ShowBalloonTip(5000, "Tab Cleaner",
                 "Ended " + ended.Count + " idle tab" + (ended.Count == 1 ? "" : "s") + ". Reload a tab to bring it back.", ToolTipIcon.Info);
         }
+        SaveState();
         RefreshMenu();
     }
 
