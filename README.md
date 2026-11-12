@@ -13,13 +13,18 @@ Nothing inside the browser is changed (WorkStream doesn't accept extensions).
 2. A tab idle for **15 minutes**, or **10 minutes** when it uses more than **1.5%** of the computer's memory, is due,
    unless its title contains an allow-listed word (default `Google Maps, Dataminr, dataminr.com, google.com/maps,
    maps.google`).
-3. Only then is WorkStream's **Task Manager** used (kept open off-screen, no taskbar button): one search for that
-   tab's title, cleared straight after, gives its process (`Tab: <title>` row), which is ended, which is what
-   End task does. Embedded frames (`Subframe: ...`) are never ended on their own. Tabs the browser already put to
-   sleep have no process and are left alone. At most 5 tabs a minute, one at a time.
+3. The due tab's process (`Tab: <title>` row) is found in WorkStream's **Task Manager** (kept open off-screen, no
+   taskbar button) and ended, which is what End task does. All processes for a title are ended together, so duplicate
+   copies of a page go at once. Embedded frames (`Subframe: ...`) are never ended on their own. Tabs the browser has
+   itself put to sleep have no process, so they are left alone.
 
-Why so gentle: version 1.3.0 kept the Task Manager filtered and re-read it every minute while ending many tabs at
-once; WorkStream's main process then stopped itself (a Chromium internal check, 0x80000003).
+### Works when WorkStream is minimised
+
+The tab strip and the renderer process list stay readable even when WorkStream is minimised, but Chromium **freezes
+its Task Manager** the moment the window is minimised, so the tab&nbsp;→&nbsp;process map can't be read then. Tab Cleaner
+remembers the last map it read while the window was in use and, while minimised, ends idle tabs from it — killing a
+process only after confirming it is still a live WorkStream renderer, so a tab that has since slept or closed is
+skipped. The active tab, allow list and idle timing all come from the tab strip, so nothing you are using is closed.
 
 The idle limit menu also has **1 minute (for testing)**.
 
