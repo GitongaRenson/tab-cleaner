@@ -1,6 +1,6 @@
 # Tab Cleaner
 
-A small Windows taskbar (system tray) app that ends WorkStream Browser tabs left idle for 30 minutes, using
+A small Windows taskbar (system tray) app that ends WorkStream Browser tabs left idle for 15 minutes, using
 WorkStream's own Task Manager (Shift+Esc). An ended tab shows a reload page; reloading it brings the page back.
 Nothing inside the browser is changed (WorkStream doesn't accept extensions).
 
@@ -10,7 +10,7 @@ Nothing inside the browser is changed (WorkStream doesn't accept extensions).
    window; it is never ended, even while its window is minimised or covered. Every other tab is idle from the moment
    you leave it, including tabs playing sound and busy tabs. Tabs already open when Tab Cleaner starts are counted
    from when the browser opened them, not from when the app started, and the clocks are remembered across restarts.
-2. A tab idle for **30 minutes**, or **10 minutes** when it uses more than **1.5%** of the computer's memory, is due,
+2. A tab idle for **15 minutes**, or **10 minutes** when it uses more than **1.5%** of the computer's memory, is due,
    unless its title contains an allow-listed word (default `Google Maps, Dataminr, dataminr.com, google.com/maps,
    maps.google`).
 3. Only then is WorkStream's **Task Manager** used (kept open off-screen, no taskbar button): one search for that
