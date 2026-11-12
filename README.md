@@ -8,7 +8,8 @@ Nothing inside the browser is changed (WorkStream doesn't accept extensions).
 
 1. Only WorkStream's **tab strip** is read (read-only, like a screen reader). **Active** = the selected tab of each
    window; it is never ended, even while its window is minimised or covered. Every other tab is idle from the moment
-   you leave it, including tabs playing sound and busy tabs.
+   you leave it, including tabs playing sound and busy tabs. Tabs already open when Tab Cleaner starts are counted
+   from when the browser opened them, not from when the app started, and the clocks are remembered across restarts.
 2. A tab idle for **30 minutes**, or **10 minutes** when it uses more than **1.5%** of the computer's memory, is due,
    unless its title contains an allow-listed word (default `Google Maps, Dataminr, dataminr.com, google.com/maps,
    maps.google`).
