@@ -1,30 +1,32 @@
-# WorkStream Tab Cleaner
+# Tab Cleaner
 
-A small Windows taskbar (system tray) app that ends WorkStream Browser tabs left idle for 30 minutes, like
-"End task" in Task Manager. An ended tab shows a reload page; reloading it brings the page back.
+A small Windows taskbar (system tray) app that ends WorkStream Browser tabs left idle for 30 minutes, using
+WorkStream's own Task Manager (Shift+Esc). An ended tab shows a reload page; reloading it brings the page back.
+Nothing inside the browser is changed (WorkStream doesn't accept extensions).
 
-## How it decides a tab is idle
+## How it decides
 
-WorkStream is Chromium-based, so every tab runs in its own process. Chromium lowers a tab's process to Idle priority
-while the tab isn't on screen, and raises it again when you view it. A tab is ended when its process has:
-
-- stayed unviewed for the whole limit (30 minutes by default), and
-- used almost no CPU in that time (under 5 CPU-seconds), so tabs still working in the background are left alone.
-
-Never ended: the tab you last had on screen in each window (even when the window is covered or minimised), tabs
-playing sound, extensions (CloudFactory's included), the WorkStream monitor, the browser itself, GPU and helpers.
-Nothing inside WorkStream is changed.
+1. Every minute it looks at WorkStream's tab processes. Chromium lowers a process to Idle priority while its tab
+   isn't on screen. A process that stays that way for the whole limit (30 min), using almost no CPU, is due.
+   Active tabs are never ended: the tab on screen, tabs in other visible windows, tabs playing sound, and the tab
+   each window had on screen last (even while the window is covered or minimised).
+2. For due processes it reads WorkStream's Task Manager, which names what each process holds:
+   - `Tab: <page title>`: a tab, the only thing Tab Cleaner ends;
+   - `Subframe: https://site/`: something embedded in a tab (ads, videos, maps), never ended on its own, because
+     that breaks the page around it, and it closes anyway when its tab is ended.
+3. Allow list: a process holding a tab whose Task Manager name contains an allow-listed word is never ended.
+   Default: `Google Maps, Dataminr, dataminr.com, google.com/maps, maps.google`.
+4. Otherwise it selects the row and presses **End task**. If the button can't be used (the Task Manager is kept
+   off-screen), it ends that same process directly, which is what End task does.
 
 ## Tray menu
 
-Status · Idle limit (15/30/45/60/90 minutes) · Pause · Show a message when tabs are ended · Start with Windows ·
-End idle tabs now · Open log · Exit
+Status, Idle limit (15/30/45/60/90 min), Edit allow list, Pause, Show a message when tabs are ended,
+Start with Windows, Open log, Exit. Settings and log: `%LOCALAPPDATA%\TabCleaner\`.
 
-Settings and log: `%LOCALAPPDATA%\WorkStreamTabCleaner\`.
+## Build and test
 
-## Build
+`build.bat` compiles `src\TabCleaner.cs` with the C# compiler included in Windows (.NET Framework 4, plus Windows'
+UI Automation libraries) into `out\TabCleaner.exe`.
 
-`build.bat` compiles `src\TabCleaner.cs` with the C# compiler included in Windows (.NET Framework 4) into
-`out\WorkStreamTabCleaner.exe`. No other tools needed.
-
-Testing on another Chromium browser: `WorkStreamTabCleaner.exe --exe chrome.exe --match <profile folder> --minutes 1`.
+Test switches: `--minutes N` (short limit), `--dry-run` (only log what would be ended), `--exe name.exe`.
