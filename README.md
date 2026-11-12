@@ -4,22 +4,23 @@ A small Windows taskbar (system tray) app that ends WorkStream Browser tabs left
 WorkStream's own Task Manager (Shift+Esc). An ended tab shows a reload page; reloading it brings the page back.
 Nothing inside the browser is changed (WorkStream doesn't accept extensions).
 
-## How it decides
+## How it decides (every minute)
 
-1. Every minute it looks at WorkStream's tab processes. Chromium lowers a process to Idle priority while its tab
-   isn't on screen. A process that stays that way for the whole limit is due: 30 minutes, or 10 minutes for a tab
-   using more than 1.5% of the computer's memory. A tab using real CPU each minute (an upload, processing) is busy
-   and not ended.
-   Active tabs are never ended: the tab on screen, tabs in other visible windows, tabs playing sound, and the tab
-   each window had on screen last (even while the window is covered or minimised).
-2. For due processes it reads WorkStream's Task Manager, which names what each process holds:
+1. **Active** = the selected tab of each WorkStream window, read from the tab strip. It is never ended, even while
+   its window is minimised or covered. Every other tab is idle from the moment you leave it, including tabs playing
+   sound and busy tabs.
+2. WorkStream's Task Manager (kept open off-screen, no taskbar button) tells which process holds which tab. Its list
+   only exposes the rows that fit in its window, so Tab Cleaner types `Tab:` in its search box (just the tabs), and
+   searches for any tab still missing by its title. Tabs the browser has already put to sleep have no process and
+   aren't listed.
    - `Tab: <page title>`: a tab, the only thing Tab Cleaner ends;
    - `Subframe: https://site/`: something embedded in a tab (ads, videos, maps), never ended on its own, because
      that breaks the page around it, and it closes anyway when its tab is ended.
-3. Allow list: a process holding a tab whose Task Manager name contains an allow-listed word is never ended.
-   Default: `Google Maps, Dataminr, dataminr.com, google.com/maps, maps.google`.
-4. Otherwise it ends exactly that process, which is what the Task Manager's End task does. The list is read in
-   full (it scrolls through it); the Task Manager window is kept open off-screen.
+3. A tab idle for **30 minutes**, or **10 minutes** when it uses more than **1.5%** of the computer's memory, is
+   ended, unless its Task Manager name contains an allow-listed word (default `Google Maps, Dataminr, dataminr.com,
+   google.com/maps, maps.google`). Ending = ending exactly that tab's process, which is what End task does.
+
+The idle limit menu also has **1 minute (for testing)**: every tab not selected is ended after a minute.
 
 ## Install on any Windows PC
 
@@ -33,7 +34,7 @@ optionally starts with Windows, and is listed in Settings > Apps for uninstallin
 It runs in the background from the taskbar's notification area. Click its icon:
 **Stop Tab Cleaner / Start Tab Cleaner**, status, idle limit, Edit allow list, messages on/off, Start with Windows,
 Open log, Exit. Settings and log: `%LOCALAPPDATA%\TabCleaner\` (`settings.ini`: allow, idleMinutes,
-bigTabPercent, bigTabMinutes, busyCpuPerMinute, browser).
+bigTabPercent, bigTabMinutes, browser).
 
 ## Build and test
 
