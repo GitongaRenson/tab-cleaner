@@ -25,7 +25,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 static class Program {
-    public const string Version = "1.5.0";
+    public const string Version = "1.5.1";
 
     [STAThread]
     static void Main(string[] args) {
@@ -239,7 +239,7 @@ static class BrowserTaskManager {
 
 class TrayApp : ApplicationContext {
     // ---- settings (%LOCALAPPDATA%\TabCleaner\settings.ini)
-    int idleMinutes = 30;
+    int idleMinutes = 15;   // default idle limit (minutes)
     bool stopped = false;
     bool notify = true;
     double bigTabPercent = 1.5;     // a tab using more than this share of the computer's memory...
@@ -656,7 +656,7 @@ class TrayApp : ApplicationContext {
                 }
             }
         }
-        if (idleMinutes < 1) idleMinutes = 30;
+        if (idleMinutes < 1) idleMinutes = 15;
     }
     void SaveSettings() {
         File.WriteAllText(IniPath,
